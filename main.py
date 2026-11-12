@@ -47,8 +47,9 @@ def load_raw(url: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(text))
 
 
-def to_tidy(wide: pd.DataFrame) -> pd.DataFrame:
-    """연도 x 1~12월 표를 [연도, 월, 전력, 날짜] 긴 표로 바꾼다. 값 0 = 집계 없음 → 제외."""
+def to_tidy(wide: pd.DataFrame, keep_zero: bool = False) -> pd.DataFrame:
+    """연도 x 1~12월 표를 [연도, 월, 전력, 날짜] 긴 표로 바꾼다.
+    값 0 = 집계 없음이라 기본은 제외하고, keep_zero=True 이면 0도 남긴다(결측 점검용)."""
     wide = wide.copy()
     wide.columns = [str(c).strip() for c in wide.columns]
     month_cols = [c for c in wide.columns if c.endswith("월")]
@@ -57,7 +58,10 @@ def to_tidy(wide: pd.DataFrame) -> pd.DataFrame:
     long["전력"] = pd.to_numeric(
         long["전력"].astype(str).str.replace(",", "", regex=False), errors="coerce"
     )
-    long = long[long["전력"] > 0].copy()
+    long = long.dropna(subset=["전력"])
+    if not keep_zero:
+        long = long[long["전력"] > 0]
+    long = long.copy()
     long["날짜"] = pd.to_datetime(dict(year=long["연도"].astype(int), month=long["월"], day=1))
     return long.sort_values("날짜").reset_index(drop=True)[["연도", "월", "전력", "날짜"]]
 
@@ -163,6 +167,94 @@ data = data.assign(
 )
 peaks = data[data["피크"]]
 
+# ----------------------------------------------------------------------------
+# 데이터 품질 점검 계산 (결측치 · 이상치) - 🧹 탭과 🔍 탭에서 함께 사용
+# ----------------------------------------------------------------------------
+rd = raw_df.copy()
+rd.columns = [str(c).strip() for c in rd.columns]
+month_cols = [c for c in rd.columns if c.endswith("월")]
+raw_vals = rd.set_index("연도")[month_cols].apply(pd.to_numeric, errors="coerce").sort_index()
+n_rows, n_cols = rd.shape
+n_cells = int(raw_vals.size)
+n_zero = int((raw_vals == 0).sum().sum())
+n_nan = int(raw_vals.isna().sum().sum())
+n_dup = int(rd["연도"].duplicated().sum())
+valid_per_year = (raw_vals > 0).sum(axis=1)
+n_sparse_years = int((valid_per_year < 12).sum())
+full_idx = valid_per_year[valid_per_year == 12].index
+first_full_year = int(full_idx.min()) if len(full_idx) else int(raw_vals.index.min())
+
+# --- 결측치: 0 이 어디에 있는지 분류 ---
+grid = to_tidy(rd, keep_zero=True)  # 0 을 포함한 전체 달력 [연도, 월, 전력, 날짜]
+valid_dates = grid.loc[grid["전력"] > 0, "날짜"]
+first_valid, last_valid = valid_dates.min(), valid_dates.max()
+zero_grid = grid[grid["전력"] == 0]
+n_before = int((zero_grid["날짜"] < first_valid).sum())  # 첫 기록 이전
+n_after = int((zero_grid["날짜"] > last_valid).sum())  # 마지막 기록 이후
+n_inner = int(len(zero_grid) - n_before - n_after)  # 기록 기간 중간 공백
+
+inner = grid[(grid["날짜"] >= first_valid) & (grid["날짜"] <= last_valid)].copy()
+inner["결측"] = inner["전력"] == 0
+run_id = (inner["결측"] != inner["결측"].shift()).cumsum()
+gap_runs = (
+    inner[inner["결측"]]
+    .groupby(run_id[inner["결측"]])
+    .agg(시작=("날짜", "min"), 끝=("날짜", "max"), 개월수=("날짜", "size"))
+    .reset_index(drop=True)
+)
+continuous_from = (
+    gap_runs["끝"].max() + pd.offsets.MonthBegin(1) if len(gap_runs) else first_valid
+)
+
+
+def trend_stats(df_: pd.DataFrame):
+    """선형회귀로 본 연간 기울기, R², 데이터 개수 (처리 방식 비교용)."""
+    t0 = df_["날짜"].min()
+    X_ = elapsed_months(df_["날짜"], t0).reshape(-1, 1)
+    y_ = df_["전력"].values
+    mdl = LinearRegression().fit(X_, y_)
+    return float(mdl.coef_[0] * 12), float(r2_score(y_, mdl.predict(X_))), len(df_)
+
+
+sel = grid[grid["날짜"] >= pd.Timestamp(year=int(start_year), month=1, day=1)]
+interp = (
+    grid.set_index("날짜")["전력"].replace(0, np.nan).loc[first_valid:last_valid].interpolate()
+    .reset_index()
+)
+interp.columns = ["날짜", "전력"]
+cmp_opts = [
+    ("① 0 제외 · 현재 분석 구간 (채택)", sel[sel["전력"] > 0]),
+    ("② 0 제외 · 전체 유효값", grid[grid["전력"] > 0]),
+    ("③ 0 그대로 포함 · 현재 분석 구간", sel),
+    ("④ 0 그대로 포함 · 전체 기간", grid),
+    ("⑤ 선형보간으로 공백을 채움 · 전체 유효 구간 (참고)", interp),
+]
+cmp_df = pd.DataFrame(
+    [
+        {"처리 방식": name, f"기울기({UNIT}/년)": sl, "R²": r2_, "데이터 수": n_}
+        for name, d_ in cmp_opts
+        for sl, r2_, n_ in [trend_stats(d_)]
+    ]
+)
+
+# --- 이상치: 4가지 방법 ---
+s_ = data["전력"]
+q1_, q3_ = s_.quantile(0.25), s_.quantile(0.75)
+iqr_ = q3_ - q1_
+iqr_lo, iqr_hi = q1_ - 1.5 * iqr_, q3_ + 1.5 * iqr_
+flag_iqr = (s_ < iqr_lo) | (s_ > iqr_hi)  # ① 전체 IQR
+z_all = (s_ - s_.mean()) / s_.std()
+flag_z = z_all.abs() > 3  # ② 전체 Z-점수
+adj = data["잔차"] - data.groupby("월")["잔차"].transform("mean")  # 추세와 월별 평균을 뺀 나머지
+z_adj = adj / adj.std()
+flag_adj = z_adj.abs() > 3  # ③ 추세·계절 보정 잔차 Z-점수
+prev_ok = data.groupby("월")["연도"].diff() == 1  # 바로 전 해의 같은 달이 있는 경우만
+yoy = (data.groupby("월")["전력"].pct_change() * 100).where(prev_ok)
+yoy_z = (yoy - yoy.mean()) / yoy.std()
+flag_yoy = yoy_z.abs() > 3  # ④ 전년 동월 대비 변화율 Z-점수
+n_iqr, n_z3, n_rz3, n_yoy = int(flag_iqr.sum()), int(flag_z.sum()), int(flag_adj.sum()), int(flag_yoy.sum())
+
+
 # 요약 지표
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("피크 기준값", f"{threshold:,.0f} {UNIT}")
@@ -170,27 +262,14 @@ c2.metric("피크 발생 횟수", f"{len(peaks)}회 / {len(data)}개월")
 c3.metric("연간 증가 추세", f"{m['slope'] * 12:+,.0f} {UNIT}/년")
 c4.metric("결정계수 R²", f"{m['r2']:.3f}")
 
-tab0, tab1, tab2, tab3, tab4 = st.tabs(
-    ["🧹 전처리·탐색", "📈 회귀 그래프", "📋 회귀 결과 도표", "📊 데이터 정리 차트", "🔴 피크 목록"]
+tab0, tabq, tab1, tab2, tab3, tab4 = st.tabs(
+    ["🧹 전처리·탐색", "🔍 결측·이상치 점검", "📈 회귀 그래프", "📋 회귀 결과 도표", "📊 데이터 정리 차트", "🔴 피크 목록"]
 )
 
 # --- 탭 0: 데이터 전처리 및 탐색 -------------------------------------------
 with tab0:
     # ===================== A. 데이터 전처리 =====================
     st.header("A. 데이터 전처리")
-
-    rd = raw_df.copy()
-    rd.columns = [str(c).strip() for c in rd.columns]
-    month_cols = [c for c in rd.columns if c.endswith("월")]
-    raw_vals = rd.set_index("연도")[month_cols].apply(pd.to_numeric, errors="coerce").sort_index()
-    n_rows, n_cols = rd.shape
-    n_cells = int(raw_vals.size)
-    n_zero = int((raw_vals == 0).sum().sum())
-    n_nan = int(raw_vals.isna().sum().sum())
-    n_dup = int(rd["연도"].duplicated().sum())
-    valid_per_year = (raw_vals > 0).sum(axis=1)
-    n_sparse_years = int((valid_per_year < 12).sum())
-    first_full_year = int(valid_per_year[valid_per_year == 12].index.min())
 
     st.subheader("A-1. 원본 구조 확인")
     st.markdown(
@@ -201,28 +280,14 @@ with tab0:
         f"전력 사용량이 실제로 0일 수는 없으므로 0은 *집계 자료 없음*으로 해석했습니다."
     )
 
-    st.subheader("A-2. 결측(0) 처리")
+    st.subheader("A-2. 결측치·이상치 점검 결과")
     st.markdown(
-        f"- 0인 칸은 결측으로 보고 분석에서 제외했습니다. 0을 그대로 두면 평균이 낮아지고 회귀선이 아래로 끌려 내려갑니다.\n"
-        f"- 연도별로 값이 있는 달 수를 세어 보니 12개월이 모두 채워진 해는 **{first_full_year}년부터**입니다. "
-        f"그 이전 **{n_sparse_years}개 연도**는 일부 달만 있습니다."
+        f"- **결측치**: 빈 칸은 {n_nan}개지만 값이 없는 달이 0으로 채워져 있어 **0인 칸 {n_zero}개**가 실제 결측입니다. "
+        f"모두 제외했고, 값이 연속으로 있는 {first_full_year}년 이후를 기본 분석 구간으로 삼았습니다.\n"
+        f"- **이상치**: IQR·Z-점수·추세/계절 보정 방법에서는 **{n_iqr + n_z3 + n_rz3}건**, "
+        f"전년 동월 대비 변화율에서는 **{n_yoy}건**이 의심되었고 삭제·수정하지 않았습니다.\n"
+        f"- 조사 방법과 그래프, 처리 방식별 결과 비교는 **🔍 결측·이상치 점검** 탭에 정리했습니다."
     )
-    cl, cr = st.columns(2)
-    with cl:
-        present = (raw_vals > 0).astype(int)
-        present.index = present.index.astype(str)
-        fig_na = px.imshow(
-            present, aspect="auto", color_continuous_scale=[[0, "#d9d9d9"], [1, "#4C78A8"]],
-            labels=dict(x="월", y="연도"), title="자료 유무 (파랑 = 있음, 회색 = 없음(0))",
-        )
-        fig_na.update_coloraxes(showscale=False)
-        st.plotly_chart(fig_na)
-    with cr:
-        vpy = valid_per_year.reset_index()
-        vpy.columns = ["연도", "값이 있는 달 수"]
-        fig_vpy = px.bar(vpy, x="연도", y="값이 있는 달 수", title="연도별 값이 있는 달 수")
-        fig_vpy.add_hline(y=12, line_dash="dash", line_color="red", annotation_text="12개월")
-        st.plotly_chart(fig_vpy)
 
     st.subheader("A-3. 형태 변환 (넓은 표 → 긴 표)")
     st.markdown(
@@ -246,50 +311,6 @@ with tab0:
         f"기본 시작 연도를 자료가 모두 채워진 해로 잡았습니다. (사이드바에서 바꿀 수 있습니다.)"
     )
 
-    st.subheader("A-5. 이상치 확인")
-    s = data["전력"]
-    q1, q3 = s.quantile(0.25), s.quantile(0.75)
-    iqr = q3 - q1
-    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    n_iqr = int(((s < lo) | (s > hi)).sum())
-    z = (s - s.mean()) / s.std()
-    n_z3 = int((z.abs() > 3).sum())
-    rz = data["잔차"] / data["잔차"].std()
-    n_rz3 = int((rz.abs() > 3).sum())
-    outlier_msg = (
-        "세 방법 모두 이상치가 없어 **값을 지우거나 고치지 않고 그대로 사용**합니다."
-        if (n_iqr + n_z3 + n_rz3) == 0
-        else "이상치로 표시된 값이 있지만 실제 전력 사용량일 가능성이 커 **제거하지 않고** 그대로 사용합니다."
-    )
-    st.markdown(
-        f"- **IQR 방법**(Q1−1.5×IQR ~ Q3+1.5×IQR = {lo:,.0f} ~ {hi:,.0f} {UNIT}): 벗어난 값 **{n_iqr}개**\n"
-        f"- **Z-점수**(평균에서 표준편차 3배 이상 떨어진 값): **{n_z3}개** (가장 큰 |Z| = {z.abs().max():.2f})\n"
-        f"- **회귀 잔차 Z-점수**(추세를 뺀 뒤 3배 이상): **{n_rz3}개** (가장 큰 |Z| = {rz.abs().max():.2f})\n"
-        f"- {outlier_msg} 전력 피크는 '이상치'가 아니라 분석 대상이므로 삭제하면 안 됩니다."
-    )
-    cl, cr = st.columns(2)
-    with cl:
-        fig_box = px.box(data, y="전력", points="outliers", title="최대전력 박스플롯 (이상치 확인)",
-                         labels={"전력": f"전력 ({UNIT})"})
-        st.plotly_chart(fig_box)
-    with cr:
-        zdf = pd.DataFrame({"날짜": data["날짜"], "Z-점수": z.values})
-        fig_z = px.scatter(zdf, x="날짜", y="Z-점수", title="Z-점수 (±3 밖이면 이상치 후보)")
-        fig_z.add_hline(y=3, line_dash="dash", line_color="red")
-        fig_z.add_hline(y=-3, line_dash="dash", line_color="red")
-        st.plotly_chart(fig_z)
-
-    last = data.iloc[-1]
-    same = all_data[(all_data["월"] == last["월"]) & (all_data["연도"] < last["연도"])].tail(5)["전력"]
-    if len(same) > 0:
-        ratio = last["전력"] / same.mean()
-        st.markdown(
-            f"- **마지막 달 점검**: 가장 최근 값은 {last['날짜']:%Y-%m}의 {last['전력']:,.0f} {UNIT}이며, "
-            f"같은 달 직전 {len(same)}년 평균의 **{ratio:.1%}** 수준입니다. "
-            f"{'비슷한 수준이라 눈에 띄는 이상은 없습니다.' if 0.9 <= ratio <= 1.1 else '차이가 커서 아직 집계가 끝나지 않은 값인지 확인이 필요합니다.'} "
-            f"(최종 확정값인지는 자료만으로 알 수 없습니다.)"
-        )
-
     st.divider()
 
     # ===================== B. 데이터 탐색 (EDA) =====================
@@ -298,6 +319,8 @@ with tab0:
 
     # B-1 기술통계
     st.subheader("B-1. 기술통계")
+    s = data["전력"]
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
     desc = pd.DataFrame(
         {
             "항목": ["개수", "평균", "표준편차", "최소", "25%", "중앙값", "75%", "최대", "왜도", "첨도"],
@@ -452,8 +475,8 @@ with tab0:
     # ===================== C. 정리 =====================
     st.header("C. 탐색 결과 요약과 모델링 시사점")
     st.markdown(
-        f"1. **전처리**: 0({n_zero}칸)을 결측으로 제외하고 긴 표로 바꿨으며, 분석 구간 {len(data)}개월에는 빠진 달 {n_gap}개, "
-        f"이상치 후보 {n_iqr + n_z3 + n_rz3}건입니다.\n"
+        f"1. **전처리**: 0({n_zero}칸)을 결측으로 제외하고 긴 표로 바꿨으며, 분석 구간 {len(data)}개월에는 빠진 달 {n_gap}개입니다. "
+        f"이상치 의심은 IQR·Z·보정 잔차 기준 {n_iqr + n_z3 + n_rz3}건, 전년 동월 대비 기준 {n_yoy}건이었고 모두 그대로 사용했습니다.\n"
         f"2. **장기 추세**: 시간과 전력의 상관계수가 {corr_time:.2f}이므로 "
         f"{'시간(t)을 독립변수로 쓰는 **선형회귀가 적합**합니다' if corr_time > 0.5 else '선형회귀의 설명력이 낮을 수 있습니다'}. "
         f"추세는 연 {m['slope'] * 12:+,.0f} {UNIT}입니다.\n"
@@ -463,6 +486,214 @@ with tab0:
         f"4. **피크 기준**: 추세 때문에 기준값을 하나로 고정하면 뒤쪽 연도에 피크가 몰립니다. "
         f"그래서 평균+k×표준편차, 상위 N% 등 기준을 바꿔 가며 피크 횟수를 비교하도록 만들었습니다."
     )
+
+# --- 탭 Q: 결측치·이상치 점검 ------------------------------------------------
+with tabq:
+    st.header("결측치·이상치 점검")
+    st.caption("결측치와 이상치가 있는지 조사하고, 어떻게 처리했는지 근거와 함께 정리했습니다.")
+
+    # ===================== 1. 결측치 =====================
+    st.subheader("1. 결측치 조사")
+    miss_tbl = pd.DataFrame(
+        {
+            "구분": [
+                "빈 칸(NaN)", "값이 0인 칸 (전체)", "  · 첫 기록 이전 (수집 시작 전)",
+                "  · 마지막 기록 이후 (아직 집계되지 않은 달)", "  · 기록 기간 중간의 공백",
+            ],
+            "개수": [n_nan, n_zero, n_before, n_after, n_inner],
+            "전체 칸 대비": [f"{v / n_cells:.1%}" for v in [n_nan, n_zero, n_before, n_after, n_inner]],
+        }
+    )
+    st.dataframe(miss_tbl, hide_index=True)
+    longest = int(gap_runs["개월수"].max()) if len(gap_runs) else 0
+    st.markdown(
+        f"- **빈 칸(NaN)은 {n_nan}개**입니다. 하지만 값이 없는 달을 비워 두지 않고 **0으로 채워 놓았기 때문**에, "
+        f"실제 결측은 0인 칸 **{n_zero}개({n_zero / n_cells:.1%})**입니다. "
+        f"전력 사용량이 0일 수는 없으므로 0은 *자료 없음*으로 해석했습니다.\n"
+        f"- 첫 기록은 **{first_valid:%Y-%m}**, 마지막 기록은 **{last_valid:%Y-%m}**입니다.\n"
+        f"- 0인 칸의 종류: 첫 기록 이전 **{n_before}개**, 마지막 기록 이후 **{n_after}개**"
+        f"({'아직 집계되지 않은 달로 보입니다' if n_after else '없음'}), "
+        f"기록 기간 중간의 공백 **{n_inner}개**({len(gap_runs)}개 구간, 가장 긴 공백 {longest}개월)입니다.\n"
+        + (
+            f"- 중간 공백은 마지막이 **{gap_runs['끝'].max():%Y-%m}**에서 끝나고, "
+            f"**{continuous_from:%Y-%m}부터는 매달 값이 연속**으로 있습니다."
+            if len(gap_runs)
+            else "- 중간에 빠진 달은 없고 첫 기록부터 매달 값이 연속으로 있습니다."
+        )
+    )
+
+    cl, cr = st.columns(2)
+    with cl:
+        present = (raw_vals > 0).astype(int)
+        present.index = present.index.astype(str)
+        fig_na = px.imshow(
+            present, aspect="auto", color_continuous_scale=[[0, "#d9d9d9"], [1, "#4C78A8"]],
+            labels=dict(x="월", y="연도"), title="자료 유무 (파랑 = 있음, 회색 = 없음(0))",
+        )
+        fig_na.update_coloraxes(showscale=False)
+        st.plotly_chart(fig_na)
+    with cr:
+        vpy = valid_per_year.reset_index()
+        vpy.columns = ["연도", "값이 있는 달 수"]
+        fig_vpy = px.bar(vpy, x="연도", y="값이 있는 달 수", title="연도별 값이 있는 달 수")
+        fig_vpy.add_hline(y=12, line_dash="dash", line_color="red", annotation_text="12개월")
+        st.plotly_chart(fig_vpy)
+
+    if len(gap_runs):
+        st.markdown("**기록 기간 중간의 공백 구간**")
+        gt = gap_runs.copy()
+        gt["시작"] = gt["시작"].dt.strftime("%Y-%m")
+        gt["끝"] = gt["끝"].dt.strftime("%Y-%m")
+        st.dataframe(gt, hide_index=True)
+
+    st.markdown("**결측(0) 처리 방식에 따른 결과 비교 (선형회귀 기울기)**")
+    st.dataframe(
+        cmp_df.style.format({f"기울기({UNIT}/년)": "{:,.0f}", "R²": "{:.3f}", "데이터 수": "{:,.0f}"}),
+        hide_index=True,
+    )
+    fig_cmp = px.bar(cmp_df, x="처리 방식", y=f"기울기({UNIT}/년)", title="처리 방식별 연간 기울기")
+    st.plotly_chart(fig_cmp)
+    c1_slope = float(cmp_df.iloc[0][f"기울기({UNIT}/년)"])
+    c4_slope = float(cmp_df.iloc[3][f"기울기({UNIT}/년)"])
+    c5_slope = float(cmp_df.iloc[4][f"기울기({UNIT}/년)"])
+    c5_r2 = float(cmp_df.iloc[4]["R²"])
+    st.markdown(
+        f"- 0을 값으로 그대로 두면(④) 연간 기울기가 **{c4_slope:,.0f} {UNIT}**로 계산되어, "
+        f"0을 제외한 결과(①, {c1_slope:,.0f} {UNIT})의 **{c4_slope / c1_slope:.1f}배**가 됩니다. "
+        f"자료 없음을 0으로 읽어 추세가 크게 왜곡되는 것입니다.\n"
+        f"- 선형보간으로 공백을 채우면(⑤) 기울기 {c5_slope:,.0f} {UNIT}, R² {c5_r2:.2f}가 나옵니다. "
+        f"하지만 채운 값은 실제로 관측한 값이 아니라 만들어 낸 값이고 공백이 {len(gap_runs)}개 구간에 걸쳐 있어 쓰지 않았습니다.\n"
+        f"- **처리 결과**: 0은 결측으로 보고 제외했고, 값이 연속으로 있는 구간만 분석에 사용했으며(기본 {start_year}년 이후) "
+        f"보간은 하지 않았습니다."
+    )
+
+    st.divider()
+
+    # ===================== 2. 이상치 =====================
+    st.subheader("2. 이상치 조사")
+    st.markdown(
+        f"- 분석 구간({data['날짜'].min():%Y-%m} ~ {data['날짜'].max():%Y-%m}, {len(data)}개월)에서 찾았습니다.\n"
+        "- **전력 피크는 이상치가 아니라 분석 대상**입니다. 여기서 찾는 것은 입력 오류나 비정상적으로 튀는 값입니다.\n"
+        "- 이 자료는 **추세(해마다 증가)와 계절성(여름·겨울 상승)**이 있어 값 하나만 보면 정상적인 여름 값이 튀어 보이거나 "
+        "겨울 값이 묻힐 수 있습니다. 그래서 값 자체를 보는 방법 2가지와, 추세·계절을 걷어낸 뒤 보는 방법 2가지를 함께 썼습니다."
+    )
+    meth = pd.DataFrame(
+        {
+            "방법": [
+                "① 전체 IQR", "② 전체 Z-점수", "③ 추세·계절 보정 잔차 Z-점수", "④ 전년 동월 대비 변화율 Z-점수",
+            ],
+            "무엇을 보나": [
+                f"{iqr_lo:,.0f} ~ {iqr_hi:,.0f} {UNIT} 밖의 값",
+                "평균에서 표준편차 3배 이상 떨어진 값",
+                "추세선과 월별 평균을 뺀 나머지가 3배 이상 큰 달",
+                "같은 달끼리 전년 대비 증감률이 3배 이상 튀는 달",
+            ],
+            "의심 값 개수": [n_iqr, n_z3, n_rz3, n_yoy],
+            "가장 큰 |점수|": [
+                "-", f"{z_all.abs().max():.2f}", f"{z_adj.abs().max():.2f}", f"{yoy_z.abs().max():.2f}",
+            ],
+        }
+    )
+    st.dataframe(meth, hide_index=True)
+
+    cl, cr = st.columns(2)
+    with cl:
+        fig_box2 = px.box(data, y="전력", points="outliers", title="① 최대전력 박스플롯",
+                          labels={"전력": f"전력 ({UNIT})"})
+        st.plotly_chart(fig_box2)
+    with cr:
+        zadf = pd.DataFrame({"날짜": data["날짜"], "보정 잔차 Z": z_adj.values})
+        fig_zadj = px.scatter(zadf, x="날짜", y="보정 잔차 Z", title="③ 추세·계절 보정 잔차 Z (±3 밖이면 의심)")
+        fig_zadj.add_hline(y=3, line_dash="dash", line_color="red")
+        fig_zadj.add_hline(y=-3, line_dash="dash", line_color="red")
+        st.plotly_chart(fig_zadj)
+
+    yoydf = pd.DataFrame({"날짜": data["날짜"], "전년 동월 대비(%)": yoy.values}).dropna()
+    fig_yoy = px.scatter(yoydf, x="날짜", y="전년 동월 대비(%)", title="④ 전년 동월 대비 변화율(%)")
+    fig_yoy.add_hline(y=float(yoy.mean() + 3 * yoy.std()), line_dash="dash", line_color="red",
+                      annotation_text="평균 + 3σ")
+    fig_yoy.add_hline(y=float(yoy.mean() - 3 * yoy.std()), line_dash="dash", line_color="red",
+                      annotation_text="평균 − 3σ")
+    st.plotly_chart(fig_yoy)
+
+    cl, cr = st.columns(2)
+    with cl:
+        st.markdown("**③ 보정 잔차 |Z| 상위 5개**")
+        idx_a = z_adj.abs().nlargest(5).index
+        ta = pd.DataFrame(
+            {"날짜": data.loc[idx_a, "날짜"].dt.strftime("%Y-%m"), f"전력({UNIT})": data.loc[idx_a, "전력"],
+             "보정 잔차 Z": z_adj.loc[idx_a]}
+        )
+        st.dataframe(ta.style.format({f"전력({UNIT})": "{:,.0f}", "보정 잔차 Z": "{:+.2f}"}), hide_index=True)
+    with cr:
+        st.markdown("**④ 전년 동월 대비 |Z| 상위 5개**")
+        idx_y = yoy_z.abs().nlargest(5).index
+        ty = pd.DataFrame(
+            {"날짜": data.loc[idx_y, "날짜"].dt.strftime("%Y-%m"), f"전력({UNIT})": data.loc[idx_y, "전력"],
+             "전년 동월 대비(%)": yoy.loc[idx_y], "Z": yoy_z.loc[idx_y]}
+        )
+        st.dataframe(
+            ty.style.format({f"전력({UNIT})": "{:,.0f}", "전년 동월 대비(%)": "{:+.1f}", "Z": "{:+.2f}"}),
+            hide_index=True,
+        )
+
+    # --- 이상치 결론 ---
+    n_basic = n_iqr + n_z3 + n_rz3
+    yoy_list = ", ".join(
+        f"{d:%Y-%m}(전년 동월 대비 {v:+.1f}%)"
+        for d, v in zip(data.loc[flag_yoy, "날짜"], yoy[flag_yoy])
+    )
+    in_range = bool(not (flag_iqr | flag_z)[flag_yoy].any()) if n_yoy else True
+    lines = [
+        f"- **값 자체를 본 방법(①②)과 추세·계절 보정 방법(③)**에서는 의심 값이 "
+        f"{'**없습니다**' if n_basic == 0 else f'**{n_basic}건** 나왔습니다'} "
+        f"(가장 큰 점수: Z {z_all.abs().max():.2f}, 보정 잔차 Z {z_adj.abs().max():.2f}).",
+    ]
+    if n_yoy:
+        lines.append(
+            f"- **전년 동월 대비(④)** 기준으로는 **{n_yoy}건**이 기준을 넘었습니다: {yoy_list}. "
+            f"전년 같은 달 값이 평소보다 낮거나 높아서 생긴 변화일 수 있으며, 이 자료만으로 입력 오류인지는 알 수 없습니다. "
+            + ("값 자체는 전체 분포 범위 안에 있습니다." if in_range else "값 자체도 전체 분포 범위를 벗어납니다.")
+        )
+    else:
+        lines.append("- **전년 동월 대비(④)** 기준으로도 의심 값이 없습니다.")
+    lines.append(
+        "- **처리 결과**: 확실한 이상치로 볼 값이 없어 **삭제하거나 고치지 않고 그대로 사용**했습니다. "
+        "전력 사용량이 크게 달라지는 것은 실제 변동일 수 있고, 지우면 전력 피크 분석 자체가 왜곡되기 때문입니다."
+    )
+    st.markdown("\n".join(lines))
+
+    last_row = data.iloc[-1]
+    same = all_data[(all_data["월"] == last_row["월"]) & (all_data["연도"] < last_row["연도"])].tail(5)["전력"]
+    if len(same) > 0:
+        ratio = last_row["전력"] / same.mean()
+        st.markdown(
+            f"- **마지막 달 점검**: 가장 최근 값은 {last_row['날짜']:%Y-%m}의 {last_row['전력']:,.0f} {UNIT}이며, "
+            f"같은 달 직전 {len(same)}년 평균의 **{ratio:.1%}** 수준입니다. "
+            f"{'비슷한 수준이라 눈에 띄는 이상은 없습니다.' if 0.9 <= ratio <= 1.1 else '차이가 커서 아직 집계가 끝나지 않은 값인지 확인이 필요합니다.'} "
+            f"(최종 확정값인지는 자료만으로 알 수 없습니다.)"
+        )
+
+    st.divider()
+    st.subheader("3. 점검 결과 한눈에 보기")
+    summ = pd.DataFrame(
+        {
+            "항목": ["빈 칸(NaN)", "값이 0인 칸", "이상치(IQR·Z·보정 잔차)", "이상치(전년 동월 대비)"],
+            "조사 결과": [
+                f"{n_nan}개",
+                f"{n_zero}개 (첫 기록 이전 {n_before}, 마지막 기록 이후 {n_after}, 중간 공백 {n_inner})",
+                f"{n_basic}건",
+                f"{n_yoy}건",
+            ],
+            "처리": [
+                "처리할 것 없음",
+                "결측으로 제외 (보간하지 않음), 연속 구간만 사용",
+                "삭제·수정하지 않고 사용",
+                "삭제·수정하지 않고 사용 (원인은 자료로 확인 불가)" if n_yoy else "해당 없음",
+            ],
+        }
+    )
+    st.dataframe(summ, hide_index=True)
 
 # --- 탭 1: 산점도 + 추세선 + 피크 ------------------------------------------
 with tab1:
