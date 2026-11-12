@@ -16,7 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 st.set_page_config(page_title="전력 피크 분석 (선형회귀)", page_icon="⚡", layout="wide")
 
@@ -95,6 +95,45 @@ def calc_threshold(values: pd.Series, mode: str, k: float, pct: float, manual: f
     if mode == "상위 N% 분위수":
         return float(np.percentile(values, 100 - pct))
     return float(manual)
+
+
+# ----------------------------------------------------------------------------
+# 3-2. 모델링용 보조 함수 (모델은 모두 LinearRegression)
+# ----------------------------------------------------------------------------
+def make_features(dates, t0, seasonal: bool) -> pd.DataFrame:
+    """모델 입력 변수. t = 시작 월부터 지난 개월 수, seasonal=True 면 월별 더미(1월 기준) 추가."""
+    d_ = pd.Series(pd.to_datetime(dates)).reset_index(drop=True)
+    X_ = pd.DataFrame({"t": elapsed_months(d_, t0)})
+    if seasonal:
+        for mth in range(2, 13):
+            X_[f"{mth}월"] = (d_.dt.month == mth).astype(int)
+    return X_
+
+
+def reg_metrics(y_true, y_pred) -> dict:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "R²": float(r2_score(y_true, y_pred)) if len(y_true) > 1 else float("nan"),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "MAPE": float(np.mean(np.abs((y_true - y_pred) / y_true)) * 100),
+    }
+
+
+def peak_report(actual_peak: np.ndarray, pred_values: np.ndarray, thr: float) -> dict:
+    """예측값이 기준값 이상이면 '피크 예측'으로 보고 실제 피크와 비교."""
+    p = np.asarray(pred_values) >= thr
+    a = np.asarray(actual_peak)
+    tp, fp = int((p & a).sum()), int((p & ~a).sum())
+    fn, tn = int((~p & a).sum()), int((~p & ~a).sum())
+    return {
+        "실제 피크": int(a.sum()), "예측 피크": int(p.sum()),
+        "맞힌 피크": tp, "놓친 피크": fn, "잘못 예측": fp,
+        "정확도": (tp + tn) / len(p) if len(p) else float("nan"),
+        "정밀도": tp / (tp + fp) if (tp + fp) else float("nan"),
+        "재현율": tp / (tp + fn) if (tp + fn) else float("nan"),
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -262,8 +301,9 @@ c2.metric("피크 발생 횟수", f"{len(peaks)}회 / {len(data)}개월")
 c3.metric("연간 증가 추세", f"{m['slope'] * 12:+,.0f} {UNIT}/년")
 c4.metric("결정계수 R²", f"{m['r2']:.3f}")
 
-tab0, tabq, tab1, tab2, tab3, tab4 = st.tabs(
-    ["🧹 전처리·탐색", "🔍 결측·이상치 점검", "📈 회귀 그래프", "📋 회귀 결과 도표", "📊 데이터 정리 차트", "🔴 피크 목록"]
+tab0, tabq, tabm, tab1, tab2, tab3, tab4 = st.tabs(
+    ["🧹 전처리·탐색", "🔍 결측·이상치 점검", "🤖 선형회귀 모델링", "📈 회귀 그래프", "📋 회귀 결과 도표",
+     "📊 데이터 정리 차트", "🔴 피크 목록"]
 )
 
 # --- 탭 0: 데이터 전처리 및 탐색 -------------------------------------------
@@ -694,6 +734,257 @@ with tabq:
         }
     )
     st.dataframe(summ, hide_index=True)
+
+# --- 탭 M: 선형회귀 모델링 ---------------------------------------------------
+with tabm:
+    st.header("선형회귀 모델링")
+    st.caption(
+        "모델은 선형회귀(LinearRegression) 한 가지만 사용합니다. "
+        "탐색에서 확인한 추세와 계절성을 입력 변수로 반영해 두 모델을 비교합니다."
+    )
+
+    if len(data) < 36:
+        st.warning("모델링에는 최소 36개월 이상의 데이터가 필요합니다. 사이드바에서 시작 연도를 낮춰 주세요.")
+    else:
+        # ---------- 1. 모델 설계 ----------
+        st.subheader("1. 모델 설계")
+        ac12_txt = (
+            f"12개월 전 값과의 자기상관이 {data['전력'].autocorr(12):.2f}로 높아 같은 달끼리 패턴이 반복되므로"
+            if len(data) > 24
+            else "같은 달끼리 패턴이 반복될 수 있으므로"
+        )
+        st.markdown(
+            f"- **종속변수(y)**: 월별 최대전력({UNIT}), **분석 구간**: {data['날짜'].min():%Y-%m} ~ {data['날짜'].max():%Y-%m} ({len(data)}개월)\n"
+            f"- **모델 A (단순 선형회귀)**: 전력 = a × t + b  (t = {start:%Y-%m}부터 지난 개월 수) — 추세만 반영\n"
+            f"- **모델 B (계절 반영 선형회귀)**: 전력 = a × t + (월별 효과) + b  — 1월을 기준으로 2~12월 더미 변수 11개를 추가. "
+            f"{ac12_txt} 계절 효과를 넣었습니다. 모델 종류는 같은 선형회귀이고 입력 변수만 늘렸습니다.\n"
+            f"- **검증 방법**: 시계열은 시간 순서가 중요하므로 데이터를 무작위로 섞지 않고, **앞부분으로 훈련하고 마지막 N개월로 테스트**합니다. "
+            f"(무작위로 섞으면 미래 값을 보고 과거를 맞히는 셈이 됩니다.)"
+        )
+        max_test = min(60, len(data) // 2)
+        test_n = st.slider("테스트(검증) 개월 수", 6, max_test, min(24, max_test), key="test_n")
+
+        train, test = data.iloc[:-test_n], data.iloc[-test_n:]
+        feats = {flag: make_features(data["날짜"], start, flag) for flag in (False, True)}
+        Xtr = {f: feats[f].iloc[: len(train)] for f in feats}
+        Xte = {f: feats[f].iloc[len(train):] for f in feats}
+        mod = {f: LinearRegression().fit(Xtr[f], train["전력"].values) for f in feats}
+        pred_all = {f: mod[f].predict(feats[f]) for f in feats}  # 훈련 + 테스트 구간 예측
+        pred_tr = {f: pred_all[f][: len(train)] for f in feats}
+        pred_te = {f: pred_all[f][len(train):] for f in feats}
+        names = {False: "모델 A: 시간만 (단순)", True: "모델 B: 시간 + 월별 효과 (계절 반영)"}
+
+        # ---------- 2. 성능 ----------
+        st.subheader("2. 훈련·테스트 성능")
+        rows = []
+        for f in (False, True):
+            mt = reg_metrics(train["전력"], pred_tr[f])
+            ms = reg_metrics(test["전력"], pred_te[f])
+            rows.append(
+                {
+                    "모델": names[f], "훈련 R²": mt["R²"], f"훈련 RMSE({UNIT})": mt["RMSE"],
+                    "테스트 R²": ms["R²"], f"테스트 RMSE({UNIT})": ms["RMSE"],
+                    f"테스트 MAE({UNIT})": ms["MAE"], "테스트 MAPE(%)": ms["MAPE"],
+                }
+            )
+        met_df = pd.DataFrame(rows)
+        st.dataframe(
+            met_df.style.format(
+                {"훈련 R²": "{:.3f}", f"훈련 RMSE({UNIT})": "{:,.0f}", "테스트 R²": "{:.3f}",
+                 f"테스트 RMSE({UNIT})": "{:,.0f}", f"테스트 MAE({UNIT})": "{:,.0f}", "테스트 MAPE(%)": "{:.2f}"},
+                na_rep="-",
+            ),
+            hide_index=True,
+        )
+        st.caption(
+            f"훈련 {len(train)}개월({train['날짜'].min():%Y-%m} ~ {train['날짜'].max():%Y-%m}) / "
+            f"테스트 {len(test)}개월({test['날짜'].min():%Y-%m} ~ {test['날짜'].max():%Y-%m}). "
+            "RMSE·MAE는 작을수록, R²는 1에 가까울수록 좋습니다. MAPE는 평균 오차율입니다."
+        )
+
+        # ---------- 3. 실측 vs 예측 ----------
+        st.subheader("3. 실측값과 예측값 비교")
+        fig_m = go.Figure()
+        normal_m = data[~data["피크"]]
+        fig_m.add_trace(go.Scatter(x=normal_m["날짜"], y=normal_m["전력"], mode="markers", name="실측(일반)",
+                                   marker=dict(color="#4C78A8", size=6)))
+        fig_m.add_trace(go.Scatter(x=peaks["날짜"], y=peaks["전력"], mode="markers", name="실측(피크)",
+                                   marker=dict(color="red", size=9, line=dict(color="darkred", width=1))))
+        fig_m.add_trace(go.Scatter(x=data["날짜"], y=pred_all[False], mode="lines", name="모델 A 예측",
+                                   line=dict(color="gray", width=2, dash="dot")))
+        fig_m.add_trace(go.Scatter(x=data["날짜"], y=pred_all[True], mode="lines", name="모델 B 예측",
+                                   line=dict(color="black", width=2)))
+        fig_m.add_vrect(x0=test["날짜"].min().strftime("%Y-%m-%d"), x1=test["날짜"].max().strftime("%Y-%m-%d"),
+                        fillcolor="gray", opacity=0.15, line_width=0)
+        fig_m.add_annotation(x=test["날짜"].min().strftime("%Y-%m-%d"), y=1, yref="paper", text="테스트 구간",
+                             showarrow=False, xanchor="left")
+        fig_m.add_hline(y=threshold, line_dash="dash", line_color="red",
+                        annotation_text=f"피크 기준 {threshold:,.0f} {UNIT}", annotation_position="top left")
+        fig_m.update_layout(title="전체 기간 실측값과 두 모델의 예측 (회색 영역 = 테스트 구간, 훈련에 쓰지 않음)",
+                            xaxis_title="날짜", yaxis_title=f"전력 ({UNIT})",
+                            legend=dict(orientation="h", y=-0.2), height=520)
+        st.plotly_chart(fig_m)
+
+        cl, cr = st.columns(2)
+        with cl:
+            fig_te = go.Figure()
+            fig_te.add_trace(go.Scatter(x=test["날짜"], y=test["전력"], mode="lines+markers", name="실측",
+                                        line=dict(color="#4C78A8")))
+            fig_te.add_trace(go.Scatter(x=test["날짜"], y=pred_te[False], mode="lines", name="모델 A",
+                                        line=dict(color="gray", dash="dot")))
+            fig_te.add_trace(go.Scatter(x=test["날짜"], y=pred_te[True], mode="lines+markers", name="모델 B",
+                                        line=dict(color="black")))
+            fig_te.add_hline(y=threshold, line_dash="dash", line_color="red")
+            fig_te.update_layout(title="테스트 구간 확대", yaxis_title=f"전력 ({UNIT})",
+                                 legend=dict(orientation="h", y=-0.25))
+            st.plotly_chart(fig_te)
+        with cr:
+            res_b = data["전력"].values - pred_all[True]
+            rdf = pd.DataFrame({"날짜": data["날짜"], f"잔차({UNIT})": res_b,
+                                "구간": ["훈련"] * len(train) + ["테스트"] * len(test)})
+            fig_rb = px.scatter(rdf, x="날짜", y=f"잔차({UNIT})", color="구간",
+                                color_discrete_map={"훈련": "#4C78A8", "테스트": "#ff7f0e"},
+                                title="모델 B 잔차 (실측 − 예측)")
+            fig_rb.add_hline(y=0, line_color="black")
+            st.plotly_chart(fig_rb)
+
+        # ---------- 4. 피크 판정 평가 ----------
+        st.subheader("4. 전력 피크를 얼마나 맞혔나 (테스트 구간)")
+        act_pk = test["전력"].values >= threshold
+        pk_rows = []
+        for f in (False, True):
+            rep = peak_report(act_pk, pred_te[f], threshold)
+            pk_rows.append({"모델": names[f], **rep})
+        pk_tbl = pd.DataFrame(pk_rows)
+        st.dataframe(
+            pk_tbl.style.format({"정확도": "{:.1%}", "정밀도": "{:.1%}", "재현율": "{:.1%}"}, na_rep="-"),
+            hide_index=True,
+        )
+        st.caption(
+            f"예측값이 피크 기준값({threshold:,.0f} {UNIT}) 이상이면 '피크 예측'으로 봅니다. "
+            "정밀도 = 피크라고 예측한 달 중 실제 피크 비율, 재현율 = 실제 피크 중 맞힌 비율. "
+            "기준값은 모델이 학습한 값이 아니라 사이드바에서 정한 값입니다."
+        )
+
+        # ---------- 5. 최종 모델 계수 ----------
+        st.subheader("5. 최종 모델(전체 구간으로 다시 학습) 계수")
+        fin = {f: LinearRegression().fit(feats[f], data["전력"].values) for f in feats}
+        coef_b = pd.Series(fin[True].coef_, index=feats[True].columns)
+        eff = np.array([0.0] + [float(coef_b[f"{mth}월"]) for mth in range(2, 13)])
+        eff_c = eff - eff.mean()  # 12개월 평균 대비 효과
+        month_eff = pd.DataFrame({"월": list(range(1, 13)), f"계절 효과({UNIT})": eff_c})
+        res_all = {f: reg_metrics(data["전력"], fin[f].predict(feats[f])) for f in feats}
+
+        cl, cr = st.columns([1, 1])
+        with cl:
+            coef_tbl = pd.DataFrame(
+                {
+                    "항목": ["모델 A 기울기 (MW/년)", "모델 A 절편", "모델 B 기울기 (MW/년)", "모델 B 절편 (1월 기준)",
+                             "모델 A 전체 R²", "모델 B 전체 R²"],
+                    "값": [
+                        f"{fin[False].coef_[0] * 12:,.1f}", f"{fin[False].intercept_:,.1f}",
+                        f"{fin[True].coef_[0] * 12:,.1f}", f"{fin[True].intercept_:,.1f}",
+                        f"{res_all[False]['R²']:.3f}", f"{res_all[True]['R²']:.3f}",
+                    ],
+                }
+            )
+            st.dataframe(coef_tbl, hide_index=True)
+        with cr:
+            fig_eff = px.bar(month_eff, x="월", y=f"계절 효과({UNIT})",
+                             title="모델 B가 학습한 월별 계절 효과 (12개월 평균 대비)")
+            fig_eff.update_xaxes(dtick=1)
+            st.plotly_chart(fig_eff)
+        hi_m, lo_m = int(month_eff.loc[month_eff.iloc[:, 1].idxmax(), "월"]), int(month_eff.loc[month_eff.iloc[:, 1].idxmin(), "월"])
+        st.markdown(
+            f"- 시간이 1개월 지날 때마다 전력이 모델 A에서는 평균 {fin[False].coef_[0]:,.1f} {UNIT}, 모델 B에서는 {fin[True].coef_[0]:,.1f} {UNIT} 늘어납니다 "
+            f"(연 {fin[False].coef_[0] * 12:,.0f} / {fin[True].coef_[0] * 12:,.0f} {UNIT}).\n"
+            f"- 모델 B에서 계절 효과가 가장 큰 달은 **{hi_m}월**(평균 대비 {eff_c.max():+,.0f} {UNIT}), 가장 작은 달은 **{lo_m}월**({eff_c.min():+,.0f} {UNIT})입니다."
+        )
+
+        # ---------- 6. 미래 예측 ----------
+        st.subheader("6. 앞으로의 전력 예측")
+        fh = st.slider("예측 개월 수", 1, 36, 12, key="fh")
+        fdates = pd.date_range(data["날짜"].max() + pd.offsets.MonthBegin(1), periods=fh, freq="MS")
+        fa = fin[False].predict(make_features(fdates, start, False))
+        fb = fin[True].predict(make_features(fdates, start, True))
+        fc = pd.DataFrame({"날짜": fdates, "모델 A": fa, "모델 B": fb})
+        fc["피크 예측(모델 B)"] = fc["모델 B"] >= threshold
+        recent = data.tail(60)
+        fig_fc = go.Figure()
+        fig_fc.add_trace(go.Scatter(x=recent["날짜"], y=recent["전력"], mode="lines+markers", name="최근 실측",
+                                    line=dict(color="#4C78A8"), marker=dict(size=5)))
+        fig_fc.add_trace(go.Scatter(x=fc["날짜"], y=fc["모델 A"], mode="lines", name="모델 A 예측",
+                                    line=dict(color="gray", dash="dot")))
+        fig_fc.add_trace(go.Scatter(x=fc["날짜"], y=fc["모델 B"], mode="lines+markers", name="모델 B 예측",
+                                    line=dict(color="black")))
+        fpk = fc[fc["피크 예측(모델 B)"]]
+        fig_fc.add_trace(go.Scatter(x=fpk["날짜"], y=fpk["모델 B"], mode="markers", name="피크 예측(모델 B)",
+                                    marker=dict(color="red", size=11, line=dict(color="darkred", width=1))))
+        fig_fc.add_hline(y=threshold, line_dash="dash", line_color="red",
+                         annotation_text=f"피크 기준 {threshold:,.0f} {UNIT}", annotation_position="top left")
+        fig_fc.update_layout(title=f"향후 {fh}개월 예측 (최근 5년 실측과 함께)", yaxis_title=f"전력 ({UNIT})",
+                             legend=dict(orientation="h", y=-0.25))
+        st.plotly_chart(fig_fc)
+        fc_show = fc.copy()
+        fc_show["날짜"] = fc_show["날짜"].dt.strftime("%Y-%m")
+        fc_show = fc_show.rename(columns={"모델 A": f"모델 A({UNIT})", "모델 B": f"모델 B({UNIT})"})
+        st.dataframe(
+            fc_show.style.format({f"모델 A({UNIT})": "{:,.0f}", f"모델 B({UNIT})": "{:,.0f}"}),
+            hide_index=True,
+        )
+        st.download_button(
+            "예측 결과 CSV 다운로드",
+            fc_show.to_csv(index=False).encode("utf-8-sig"),
+            file_name="forecast.csv",
+            mime="text/csv",
+        )
+
+        # ---------- 7. 결론 ----------
+        st.subheader("7. 모델링 결론")
+        rm_a, rm_b = float(met_df.iloc[0][f"테스트 RMSE({UNIT})"]), float(met_df.iloc[1][f"테스트 RMSE({UNIT})"])
+        r2_a_te, r2_b_te = float(met_df.iloc[0]["테스트 R²"]), float(met_df.iloc[1]["테스트 R²"])
+        mape_b = float(met_df.iloc[1]["테스트 MAPE(%)"])
+        better = "B" if rm_b < rm_a else "A"
+        gain = (rm_a - rm_b) / rm_a * 100
+        pb = pk_tbl.iloc[1]
+        concl = [
+            f"- **성능 비교**: 테스트 RMSE는 모델 A {rm_a:,.0f}, 모델 B {rm_b:,.0f} {UNIT}이고 테스트 R²는 {r2_a_te:.2f}, {r2_b_te:.2f}입니다. "
+            + (
+                f"계절 효과를 넣은 **모델 B가 오차를 약 {gain:.0f}% 줄였습니다**."
+                if better == "B"
+                else "이번 설정에서는 계절 효과를 넣은 모델 B가 더 나아지지 않았습니다."
+            ),
+            f"- **오차 크기**: 모델 B의 테스트 평균 오차율(MAPE)은 {mape_b:.2f}%입니다.",
+            f"- **피크 판정(테스트 구간, 모델 B)**: 실제 피크 {int(pb['실제 피크'])}개월 중 {int(pb['맞힌 피크'])}개월을 맞혔고 "
+            f"{int(pb['놓친 피크'])}개월은 놓쳤으며, 피크가 아닌데 피크로 예측한 달은 {int(pb['잘못 예측'])}개월입니다.",
+            "- **한계**: 직선 추세가 앞으로도 이어진다고 가정하며, 기온·경제 활동 같은 다른 요인은 넣지 않았습니다. "
+            "테스트 구간이 짧아 결과가 구간 선택에 따라 달라질 수 있습니다.",
+        ]
+        bias_b = float((pred_te[True] - test["전력"].values).mean())
+        r2_b_tr = float(met_df.iloc[1]["훈련 R²"])
+        concl.insert(
+            2,
+            f"- **치우침 점검**: 테스트 구간에서 모델 B의 예측은 실측보다 평균 **{abs(bias_b):,.0f} {UNIT} {'높게' if bias_b > 0 else '낮게'}** 나왔습니다 "
+            f"(실측 평균 {test['전력'].mean():,.0f}, 예측 평균 {pred_te[True].mean():,.0f} {UNIT}). "
+            f"테스트 R² {r2_b_te:.2f}는 훈련 R² {r2_b_tr:.2f}보다 훨씬 낮아, "
+            + ("훈련 구간의 추세가 테스트 구간에 그대로 맞지는 않았습니다." if r2_b_te < r2_b_tr - 0.2 else "훈련과 테스트 성능이 비슷합니다."),
+        )
+        full_y = data.groupby("연도")["전력"].agg(["mean", "size"])
+        full_y = full_y[full_y["size"] == 12]["mean"]
+        if len(full_y) >= 4:
+            last4 = full_y.tail(4)
+            flat = (last4.max() - last4.min()) / last4.mean() < 0.03
+            concl.insert(
+                3,
+                f"- **최근 추세 점검**: 12개월이 모두 있는 최근 4개 연도({int(last4.index[0])}~{int(last4.index[-1])})의 연평균은 "
+                f"{last4.min():,.0f}~{last4.max():,.0f} {UNIT}로 "
+                + (
+                    "거의 늘지 않았습니다. 전체 구간의 증가 추세를 그대로 이어 붙이면 이 시기에는 예측이 높게 나올 수 있습니다."
+                    if flat
+                    else "변화가 있었습니다."
+                ),
+            )
+        st.markdown("\n".join(concl))
 
 # --- 탭 1: 산점도 + 추세선 + 피크 ------------------------------------------
 with tab1:
