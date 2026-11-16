@@ -1017,37 +1017,11 @@ with tabm:
 # --- 탭 E: 모델 평가 ---------------------------------------------------------
 with tabe:
     st.header("모델 평가")
-    st.caption(
-        "앞 탭의 두 선형회귀 모델(A: 시간만, B: 시간 + 월별 효과)을 지표 값으로 평가하고, "
-        "각 지표가 무엇을 말해 주는지 해석합니다."
-    )
+    st.caption("앞 탭의 두 선형회귀 모델(A: 시간만, B: 시간 + 월별 효과)의 성능 평가지표 값입니다.")
 
     if len(data) < 36:
         st.warning("모델 평가에는 최소 36개월 이상의 데이터가 필요합니다. 사이드바에서 시작 연도를 낮춰 주세요.")
     else:
-        # ---- 해석에 쓰는 판정 함수 ----
-        def grade_r2(v):
-            if v != v:
-                return "계산 불가"
-            if v >= 0.9:
-                return "매우 높음"
-            if v >= 0.7:
-                return "높음"
-            if v >= 0.5:
-                return "보통"
-            if v >= 0:
-                return "낮음"
-            return "평균값으로 예측하는 것보다 못함"
-
-        def grade_mape(v):
-            if v < 10:
-                return "매우 정확"
-            if v < 20:
-                return "양호"
-            if v < 50:
-                return "보통"
-            return "부정확"
-
         def f1_of(prec, rec):
             return 2 * prec * rec / (prec + rec) if (prec == prec and rec == rec and (prec + rec) > 0) else float("nan")
 
@@ -1072,10 +1046,10 @@ with tabe:
                     "변수를 늘렸을 때 R²가 오른 것이 진짜 개선인지 확인",
                     "작을수록 좋음. 큰 오차에 민감함",
                     "작을수록 좋음. 평균적으로 몇 MW 틀리는지",
-                    "10% 미만 매우 정확, 10~20% 양호, 20~50% 보통, 50% 이상 부정확 (Lewis 관례 기준)",
-                    "단위와 규모가 달라도 비교 가능",
-                    "0에 가까울수록 좋음. +면 높게, −면 낮게 예측하는 경향",
-                    "최악의 경우 오차 크기",
+                    "작을수록 좋음. 10% 미만 매우 정확, 10~20% 양호, 20~50% 보통, 50% 이상 부정확 (Lewis 관례 기준)",
+                    "작을수록 좋음. 단위와 규모가 달라도 비교 가능",
+                    "0에 가까울수록 좋음. +면 높게, −면 낮게 예측",
+                    "작을수록 좋음. 최악의 경우 오차 크기",
                 ],
             }
         )
@@ -1090,18 +1064,18 @@ with tabe:
             eval_row("모델 B · 훈련", y_tr, pred_tr[True], 12),
             eval_row("모델 B · 테스트", y_te, pred_te[True]),
         ]
-        # 참고용 단순 기준 (분석에 쓰는 모델이 아니라 비교 기준)
+        # 비교를 위한 단순 기준 (분석에 쓰는 모델이 아님)
         avg_pred = np.full(len(y_te), y_tr.mean())
         ev_rows.append(eval_row("(참고) 훈련 평균값으로 예측 · 테스트", y_te, avg_pred))
         lookup = data.set_index("날짜")["전력"]
         prev_vals = np.array([lookup.get(d_ - pd.DateOffset(years=1), np.nan) for d_ in test["날짜"]])
         ok_prev = ~np.isnan(prev_vals)
-        has_naive = bool(ok_prev.sum() >= 6)
-        if has_naive:
+        if int(ok_prev.sum()) >= 6:
             ev_rows.append(
                 eval_row(f"(참고) 전년 동월 값으로 예측 · 테스트 ({int(ok_prev.sum())}개월)", y_te[ok_prev], prev_vals[ok_prev])
             )
         ev_df = pd.DataFrame(ev_rows)
+        rm_col = f"RMSE({UNIT})"
         st.dataframe(
             ev_df.style.format(
                 {
@@ -1114,111 +1088,39 @@ with tabe:
             hide_index=True,
         )
         st.caption(
-            f"훈련 {len(train)}개월 / 테스트 {len(test)}개월. '(참고)' 행은 지표를 해석하기 위한 단순 기준일 뿐 "
+            f"훈련 {len(train)}개월 / 테스트 {len(test)}개월. '(참고)' 행은 비교를 위한 단순 기준 값이며 "
             "분석에 쓰는 모델이 아닙니다(분석 모델은 선형회귀 하나입니다)."
         )
 
-        rm_col = f"RMSE({UNIT})"
         test_rows = ev_df[ev_df["구분"].str.contains("테스트")].copy()
         test_rows["구분"] = test_rows["구분"].str.replace(" · 테스트", "", regex=False)
         fig_ev = px.bar(test_rows, x="구분", y=rm_col, title=f"테스트 구간 RMSE 비교 ({UNIT}, 작을수록 좋음)")
         st.plotly_chart(fig_ev)
 
-        # 지표 값 꺼내 쓰기
-        eA_tr, eA_te, eB_tr, eB_te = (ev_rows[0], ev_rows[1], ev_rows[2], ev_rows[3])
-        mean_te = float(y_te.mean())
-
-        # ===================== 3. 지표 해석 =====================
-        st.subheader("3. 지표를 통한 모델 성능 해석")
-        gap_b = eB_te[rm_col] / eB_tr[rm_col]
-        mae_b, rmse_b = eB_te[f"MAE({UNIT})"], eB_te[rm_col]
-        bias_b2 = eB_te[f"편향({UNIT})"]
-        interp = []
-        interp.append(
-            f"**① 설명력(R²)**: 훈련 구간에서 모델 A는 {eA_tr['R²']:.2f}({grade_r2(eA_tr['R²'])}), "
-            f"모델 B는 {eB_tr['R²']:.2f}({grade_r2(eB_tr['R²'])})입니다. 조정 R²도 {eA_tr['조정 R²']:.2f} → {eB_tr['조정 R²']:.2f}로 "
-            + ("올라 계절(월별) 변수를 넣은 것이 **진짜 개선**입니다." if eB_tr["조정 R²"] > eA_tr["조정 R²"]
-               else "오르지 않아 변수를 늘린 효과가 없습니다.")
-            + f" 하지만 테스트 구간에서는 모델 A {eA_te['R²']:.2f}({grade_r2(eA_te['R²'])}), "
-            f"모델 B {eB_te['R²']:.2f}({grade_r2(eB_te['R²'])})로 훈련 때보다 크게 떨어집니다."
+        # ===================== 3. 피크 판정 지표 =====================
+        st.subheader("3. 전력 피크 판정 지표 (테스트 구간)")
+        pk_eval = pk_tbl.copy()
+        pk_eval["F1"] = [f1_of(p_, r_) for p_, r_ in zip(pk_eval["정밀도"], pk_eval["재현율"])]
+        st.dataframe(
+            pk_eval.style.format(
+                {"정확도": "{:.1%}", "정밀도": "{:.1%}", "재현율": "{:.1%}", "F1": "{:.3f}"}, na_rep="-"
+            ),
+            hide_index=True,
         )
-        interp.append(
-            f"**② 오차 크기(RMSE·MAE·NRMSE)**: 모델 B의 테스트 RMSE는 {rmse_b:,.0f} {UNIT}(NRMSE {eB_te['NRMSE(%)']:.1f}%), "
-            f"MAE는 {mae_b:,.0f} {UNIT}입니다. 즉 평균적으로 약 {mae_b:,.0f} {UNIT} 틀립니다. "
-            f"RMSE/MAE 비율이 {rmse_b / mae_b:.2f}로 "
-            + ("1.25보다 커서 일부 달에 유독 큰 오차가 섞여 있습니다." if rmse_b / mae_b > 1.25
-               else "1에 가까워 오차가 비교적 고르게 퍼져 있습니다.")
-            + f" 가장 크게 틀린 달은 {eB_te[f'최대 절대오차({UNIT})']:,.0f} {UNIT} 차이입니다."
+        st.caption(
+            f"예측값이 피크 기준값({threshold:,.0f} {UNIT}) 이상이면 '피크 예측'으로 봅니다. "
+            "정밀도 = 피크라고 예측한 달 중 실제 피크 비율, 재현율 = 실제 피크 중 맞힌 비율, "
+            "F1 = 정밀도와 재현율의 조화평균입니다."
         )
-        interp.append(
-            f"**③ 오차율(MAPE)**: 모델 B 테스트 MAPE {eB_te['MAPE(%)']:.1f}%는 **'{grade_mape(eB_te['MAPE(%)'])}'** 수준이고, "
-            f"모델 A({eA_te['MAPE(%)']:.1f}%, {grade_mape(eA_te['MAPE(%)'])})보다 "
-            + ("낮습니다." if eB_te["MAPE(%)"] < eA_te["MAPE(%)"] else "낮지 않습니다.")
-            + (
-                f" 다만 MAPE는 전력 값 자체가 커서(평균 약 {mean_te:,.0f} {UNIT}) 오차율이 작게 보이는 지표입니다. "
-                f"같은 구간에서 전년 동월 값으로 예측한 MAPE는 {ev_rows[5]['MAPE(%)']:.1f}%라서 상대적으로는 큰 편이므로 R²·편향과 함께 봐야 합니다."
-                if (has_naive and ev_rows[5]["MAPE(%)"] < eB_te["MAPE(%)"] / 2)
-                else ""
-            )
-        )
-        interp.append(
-            f"**④ 치우침(편향)**: 모델 B는 테스트 구간에서 실측보다 평균 **{abs(bias_b2):,.0f} {UNIT} "
-            f"{'높게' if bias_b2 > 0 else '낮게'}** 예측합니다(실측 평균의 {abs(bias_b2) / mean_te * 100:.1f}%). "
-            f"훈련 구간의 편향은 {round(eB_tr[f'편향({UNIT})']) + 0:+,.0f} {UNIT}로 거의 0이어서, 이 치우침은 "
-            + ("테스트 시기에 전력 수준이 훈련 때 배운 추세와 달라졌음을 뜻합니다." if abs(bias_b2) / mean_te > 0.03
-               else "크지 않은 수준입니다.")
-            + (
-                f" 모델 A도 {eA_te[f'편향({UNIT})']:+,.0f} {UNIT}로 비슷해, 계절 변수를 넣어도 이 치우침은 줄지 않았습니다."
-                if (np.sign(eA_te[f"편향({UNIT})"]) == np.sign(bias_b2)
-                    and abs(eA_te[f"편향({UNIT})"] - bias_b2) < 0.2 * abs(bias_b2))
-                else ""
-            )
-        )
-        interp.append(
-            f"**⑤ 일반화 격차**: 테스트 RMSE가 훈련 RMSE의 **{gap_b:.2f}배**입니다. "
-            + ("격차가 커서 훈련 성능만 믿고 새로운 시기를 예측하기는 어렵습니다." if gap_b >= 1.5
-               else "격차가 다소 있습니다." if gap_b >= 1.2 else "격차가 작아 훈련·테스트 성능이 비슷합니다.")
-        )
-        ref_avg = ev_rows[4]
-        interp.append(
-            f"**⑥ 단순 기준과 비교**: 훈련 평균값으로만 예측하면 테스트 RMSE가 {ref_avg[rm_col]:,.0f} {UNIT}인데 모델 B는 {rmse_b:,.0f} {UNIT}로 "
-            + ("더 정확합니다." if rmse_b < ref_avg[rm_col] else "더 낫지 않습니다.")
-        )
-        if has_naive:
-            ref_nv = ev_rows[5]
-            if ref_nv[rm_col] < rmse_b:
-                interp.append(
-                    f"  - 하지만 **전년 같은 달 값을 그대로 쓰는 방법**의 테스트 RMSE는 {ref_nv[rm_col]:,.0f} {UNIT}(R² {ref_nv['R²']:.2f})로 "
-                    f"모델 B보다 **{rmse_b / ref_nv[rm_col]:.1f}배 작습니다**. 최근 구간에서는 이 선형회귀가 단순한 방법보다도 정확하지 않다는 뜻이며, "
-                    f"모델을 개선할 여지가 큽니다."
-                )
-            else:
-                interp.append(
-                    f"  - 전년 같은 달 값을 그대로 쓰는 방법(RMSE {ref_nv[rm_col]:,.0f} {UNIT})보다 모델 B가 더 정확합니다."
-                )
-        pA, pB = pk_tbl.iloc[0], pk_tbl.iloc[1]
-        f1A, f1B = f1_of(pA["정밀도"], pA["재현율"]), f1_of(pB["정밀도"], pB["재현율"])
-        interp.append(
-            f"**⑦ 피크 판정(분류 지표)**: 모델 B는 재현율 {pB['재현율']:.0%}, 정밀도 {pB['정밀도']:.0%}, F1 {f1B:.2f} "
-            f"(모델 A: 재현율 {pA['재현율']:.0%}, 정밀도 {pA['정밀도']:.0%}, F1 {f1A:.2f})입니다. "
-            + (
-                "실제 피크를 거의 놓치지 않지만 피크가 아닌 달도 피크로 예측해, 경보를 넉넉하게 내는 성향입니다(과대예측 편향과 같은 원인)."
-                if (pB["재현율"] >= 0.9 and pB["정밀도"] < 0.7)
-                else "피크를 놓치는 경우가 있습니다." if pB["재현율"] < 0.9 else "피크를 비교적 정확하게 가려냅니다."
-            )
-        )
-        st.markdown("\n\n".join(interp))
 
         # ===================== 4. 시계열 교차검증 =====================
-        st.subheader("4. 시계열 교차검증 (결과가 한 번의 우연이 아닌지 확인)")
+        st.subheader("4. 시계열 교차검증")
         n_splits = min(5, (len(data) - 24) // 12)
-        cv_ok = n_splits >= 2
-        if not cv_ok:
+        if n_splits < 2:
             st.info("교차검증에는 최소 48개월 이상의 데이터가 필요합니다.")
         else:
             st.markdown(
-                f"- 훈련 구간을 점점 늘려 가며(앞에서부터) 바로 뒤 12개월을 테스트하는 방식으로 **{n_splits}회** 평가했습니다. "
-                "과거로 미래를 맞히는 실제 상황과 같은 순서입니다."
+                f"훈련 구간을 점점 늘려 가며(앞에서부터) 바로 뒤 12개월을 테스트하는 방식으로 **{n_splits}회** 평가했습니다."
             )
             tscv = TimeSeriesSplit(n_splits=n_splits, test_size=12)
             y_all = data["전력"].values
@@ -1237,41 +1139,24 @@ with tabe:
                     row[f"모델 {nm} 편향"] = rr[f"편향({UNIT})"]
                 cv_rows.append(row)
             cv_df = pd.DataFrame(cv_rows)
-            st.dataframe(
-                cv_df.style.format(
-                    {"모델 A RMSE": "{:,.0f}", "모델 B RMSE": "{:,.0f}", "모델 A MAPE(%)": "{:.2f}",
-                     "모델 B MAPE(%)": "{:.2f}", "모델 A 편향": "{:+,.0f}", "모델 B 편향": "{:+,.0f}"}
-                ),
-                hide_index=True,
+            cv_fmt = {
+                "모델 A RMSE": "{:,.0f}", "모델 B RMSE": "{:,.0f}", "모델 A MAPE(%)": "{:.2f}",
+                "모델 B MAPE(%)": "{:.2f}", "모델 A 편향": "{:+,.0f}", "모델 B 편향": "{:+,.0f}",
+            }
+            st.dataframe(cv_df.style.format(cv_fmt), hide_index=True)
+
+            num_cols = list(cv_fmt.keys())
+            cv_sum = pd.DataFrame(
+                {"구분": ["평균", "표준편차"], **{c: [cv_df[c].mean(), cv_df[c].std()] for c in num_cols}}
             )
+            st.dataframe(cv_sum.style.format(cv_fmt, na_rep="-"), hide_index=True)
+
             fig_cv = go.Figure()
             fig_cv.add_trace(go.Bar(x=cv_df["회차"].astype(str), y=cv_df["모델 A RMSE"], name="모델 A"))
             fig_cv.add_trace(go.Bar(x=cv_df["회차"].astype(str), y=cv_df["모델 B RMSE"], name="모델 B"))
             fig_cv.update_layout(title=f"회차별 테스트 RMSE ({UNIT})", barmode="group", xaxis_title="회차",
                                  yaxis_title=f"RMSE ({UNIT})")
             st.plotly_chart(fig_cv)
-
-            ma, sa = cv_df["모델 A RMSE"].mean(), cv_df["모델 A RMSE"].std()
-            mb, sb = cv_df["모델 B RMSE"].mean(), cv_df["모델 B RMSE"].std()
-            b_wins = int((cv_df["모델 B RMSE"] < cv_df["모델 A RMSE"]).sum())
-            pos_b = int((cv_df["모델 B 편향"] > 0).sum())
-            neg_b = int((cv_df["모델 B 편향"] < 0).sum())
-            if pos_b == len(cv_df):
-                bias_txt = f"모든 회차({len(cv_df)}회)에서 예측이 실측보다 **높게** 나왔습니다."
-            elif neg_b == len(cv_df):
-                bias_txt = f"모든 회차({len(cv_df)}회)에서 예측이 실측보다 **낮게** 나왔습니다."
-            else:
-                bias_txt = f"예측이 높게 나온 회차 {pos_b}회, 낮게 나온 회차 {neg_b}회로 방향이 일정하지 않습니다."
-            first_rm, last_rm = cv_df["모델 B RMSE"].iloc[0], cv_df["모델 B RMSE"].iloc[-1]
-            st.markdown(
-                f"- 평균 RMSE는 모델 A {ma:,.0f} ± {sa:,.0f}, 모델 B {mb:,.0f} ± {sb:,.0f} {UNIT}입니다. "
-                f"모델 B가 {len(cv_df)}회 중 **{b_wins}회**에서 모델 A보다 정확했습니다"
-                f"{' (계절 변수의 효과가 꾸준합니다).' if b_wins == len(cv_df) else '.'}\n"
-                f"- 모델 B의 편향: {bias_txt}\n"
-                f"- 모델 B의 RMSE는 첫 회차 {first_rm:,.0f} → 마지막 회차 {last_rm:,.0f} {UNIT}로 "
-                + ("**갈수록 커졌습니다**. 최근으로 올수록 과거 추세가 덜 맞는다는 신호입니다." if last_rm > first_rm * 1.15
-                   else "큰 차이가 없습니다.")
-            )
 
         # ===================== 5. 잔차 진단 =====================
         st.subheader("5. 잔차 진단 (모델 B, 훈련 구간)")
@@ -1283,21 +1168,12 @@ with tabe:
         sk, ku = float(stats.skew(e_tr)), float(stats.kurtosis(e_tr))
         diag = pd.DataFrame(
             {
-                "항목": ["잔차 평균", "잔차 표준편차", "왜도 / 첨도", "정규성 검정 (Shapiro-Wilk p값)",
+                "항목": ["잔차 평균", "잔차 표준편차", "왜도", "첨도", "Shapiro-Wilk p값",
                          "Durbin-Watson", "잔차 자기상관 (1개월 간격)", "잔차 자기상관 (12개월 간격)"],
                 "값": [
-                    f"{e_tr.mean():+,.1f} {UNIT}", f"{e_tr.std():,.0f} {UNIT}", f"{sk:.2f} / {ku:.2f}",
+                    f"{e_tr.mean() + 0.0:+,.1f} {UNIT}", f"{e_tr.std():,.0f} {UNIT}", f"{sk:.2f}", f"{ku:.2f}",
                     f"{sh_p:.4f}" if sh_p == sh_p else "-", f"{dw:.2f}", f"{ac1:.2f}",
                     f"{ac12:.2f}" if ac12 == ac12 else "-",
-                ],
-                "판단": [
-                    "0에 가까움 (최소제곱법의 성질)",
-                    f"예측이 보통 ±{e_tr.std():,.0f} {UNIT} 안팎으로 흩어짐",
-                    "0에 가까울수록 대칭·정규분포에 가까움",
-                    ("정규분포로 볼 수 있음" if sh_p >= 0.05 else "정규분포에서 벗어남") if sh_p == sh_p else "-",
-                    "독립적" if 1.5 <= dw <= 2.5 else ("양(+)의 자기상관 — 오차가 이어짐" if dw < 1.5 else "음(−)의 자기상관"),
-                    "자기상관 거의 없음" if abs(ac1) < 0.3 else "자기상관 있음",
-                    ("자기상관 거의 없음" if abs(ac12) < 0.3 else "계절 패턴이 남아 있음") if ac12 == ac12 else "-",
                 ],
             }
         )
@@ -1315,85 +1191,13 @@ with tabe:
             fig_qq.add_trace(go.Scatter(x=[float(osm.min()), float(osm.max())],
                                         y=[qs * float(osm.min()) + qi, qs * float(osm.max()) + qi],
                                         mode="lines", name="정규분포 기준선", line=dict(color="red")))
-            fig_qq.update_layout(title="Q-Q 그림 (선에 붙을수록 정규분포)", xaxis_title="이론 분위수",
-                                 yaxis_title=f"잔차 ({UNIT})")
+            fig_qq.update_layout(title="Q-Q 그림", xaxis_title="이론 분위수", yaxis_title=f"잔차 ({UNIT})")
             st.plotly_chart(fig_qq)
         with c3_:
             fvr = pd.DataFrame({f"예측값({UNIT})": pred_tr[True], f"잔차({UNIT})": e_tr})
             fig_fv = px.scatter(fvr, x=f"예측값({UNIT})", y=f"잔차({UNIT})", title="예측값 대비 잔차")
             fig_fv.add_hline(y=0, line_color="black")
             st.plotly_chart(fig_fv)
-
-        diag_lines = []
-        if dw < 1.5 or abs(ac1) >= 0.3:
-            diag_lines.append(
-                f"- Durbin-Watson이 {dw:.2f}(2에 가까워야 독립), 1개월 간격 잔차 자기상관이 {ac1:.2f}입니다. "
-                "오차가 한 달에서 다음 달로 이어진다는 뜻이며, 직선 추세와 월별 효과만으로는 설명되지 않는 변화가 남아 있다는 신호입니다. "
-                "선형회귀의 '오차는 서로 독립' 가정이 지켜지지 않아 **회귀계수의 유의성 검정이나 신뢰구간은 믿기 어렵고**, "
-                "예측값에 치우침이 생기는 원인이 될 수 있습니다."
-            )
-        else:
-            diag_lines.append(f"- Durbin-Watson {dw:.2f}, 자기상관 {ac1:.2f}로 오차의 독립성 가정이 대체로 지켜집니다.")
-        if sh_p == sh_p:
-            diag_lines.append(
-                f"- 정규성 검정 p값이 {sh_p:.4f}로 "
-                + ("0.05보다 작아 잔차가 정규분포에서 다소 벗어납니다" if sh_p < 0.05 else "0.05 이상이라 정규분포로 볼 수 있습니다")
-                + f" (왜도 {sk:.2f}, 첨도 {ku:.2f}). "
-                + ("다만 왜도·첨도가 크지 않아 심각한 수준은 아닙니다." if (abs(sk) < 0.5 and abs(ku) < 1) else "분포가 한쪽으로 치우쳐 있습니다.")
-            )
-        st.markdown("\n".join(diag_lines))
-
-        # ===================== 6. 종합 평가 =====================
-        st.subheader("6. 종합 모델 평가")
-        gen_good = (eB_te["R²"] >= 0.5) and (gap_b < 1.3)
-        better_all = all(
-            [
-                eB_tr["R²"] > eA_tr["R²"], eB_te["R²"] > eA_te["R²"],
-                eB_tr[rm_col] < eA_tr[rm_col], eB_te[rm_col] < eA_te[rm_col],
-                eB_tr[f"MAE({UNIT})"] < eA_tr[f"MAE({UNIT})"], eB_te[f"MAE({UNIT})"] < eA_te[f"MAE({UNIT})"],
-                eB_tr["MAPE(%)"] < eA_tr["MAPE(%)"], eB_te["MAPE(%)"] < eA_te["MAPE(%)"],
-            ]
-        )
-        summ_rows = [
-            ("설명력 (훈련 R²)", f"{eB_tr['R²']:.2f} (조정 {eB_tr['조정 R²']:.2f})", grade_r2(eB_tr["R²"])),
-            ("일반화 (테스트 R²)", f"{eB_te['R²']:.2f}", grade_r2(eB_te["R²"])),
-            ("예측 정확도 (테스트 MAPE)", f"{eB_te['MAPE(%)']:.1f}%",
-             grade_mape(eB_te["MAPE(%)"])
-             + (" (단, 전년 동월 방식보다는 큼)" if (has_naive and ev_rows[5]["MAPE(%)"] < eB_te["MAPE(%)"] / 2) else "")),
-            (f"치우침 (테스트 편향)", f"{bias_b2:+,.0f} {UNIT}",
-             ("높게 예측하는 경향" if bias_b2 > 0 else "낮게 예측하는 경향") if abs(bias_b2) / mean_te > 0.03 else "작음"),
-            ("훈련 대비 테스트 오차", f"{gap_b:.2f}배", "격차 큼" if gap_b >= 1.5 else ("다소 큼" if gap_b >= 1.2 else "작음")),
-            ("피크 판정 (재현율 / 정밀도)", f"{pB['재현율']:.0%} / {pB['정밀도']:.0%}",
-             "놓치지 않지만 과대 경보" if (pB["재현율"] >= 0.9 and pB["정밀도"] < 0.7) else ("놓침 있음" if pB["재현율"] < 0.9 else "양호")),
-            ("잔차 독립성 (Durbin-Watson)", f"{dw:.2f}", "독립적" if 1.5 <= dw <= 2.5 else "자기상관 있음"),
-        ]
-        if cv_ok:
-            summ_rows.append(("교차검증 평균 RMSE (모델 B)", f"{mb:,.0f} ± {sb:,.0f} {UNIT}", bias_txt.replace("**", "")))
-        if has_naive:
-            summ_rows.append(
-                ("전년 동월 값 대비", f"{ev_rows[5][rm_col]:,.0f} vs {rmse_b:,.0f} {UNIT}",
-                 "단순 방법이 더 정확" if ev_rows[5][rm_col] < rmse_b else "모델 B가 더 정확")
-            )
-        summ_df = pd.DataFrame(summ_rows, columns=["평가 항목", "결과", "판단"])
-        st.dataframe(summ_df, hide_index=True)
-
-        verdict = [
-            f"**종합**: 계절(월별 효과)을 반영한 선형회귀(모델 B)는 훈련 구간에서 설명력이 {grade_r2(eB_tr['R²'])}"
-            f"(R² {eB_tr['R²']:.2f})이고, 단순 선형회귀(모델 A)보다 R²·RMSE·MAE·MAPE가 "
-            + ("훈련·테스트 모두에서 좋아졌습니다. " if better_all else "대체로 좋아졌습니다. ")
-            + (
-                "테스트 구간에서도 성능이 유지되어 예측에 활용할 수 있습니다."
-                if gen_good
-                else f"그러나 테스트 구간에서는 R² {eB_te['R²']:.2f}, 오차가 훈련의 {gap_b:.1f}배로 일반화가 부족해, "
-                "**정확한 수치 예측보다는 '월별 계절 패턴'과 '장기 평균 증가 추세'를 파악하는 용도**로 해석하는 것이 적절합니다."
-            ),
-            f"**원인 추정**: 오차가 한쪽(높게)으로 치우치고 잔차에 자기상관이 남아 있는 점으로 볼 때, "
-            f"직선 하나로 전체 기간의 증가 추세를 표현한 것이 최근 구간에 맞지 않는 것으로 보입니다. "
-            "(이 앱의 자료만으로 원인을 확정할 수는 없습니다.)",
-            "**개선 방향(선형회귀 범위 안)**: ① 최근 몇 년의 자료만으로 학습, ② 추세가 바뀐 시점을 기준으로 구간을 나눠 각각 선형회귀, "
-            "③ 기온 등 전력 수요와 관련된 변수를 입력에 추가. (이 앱에는 아직 구현하지 않았습니다.)",
-        ]
-        st.markdown("\n\n".join(verdict))
 
 # --- 탭 1: 산점도 + 추세선 + 피크 ------------------------------------------
 with tab1:
